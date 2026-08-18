@@ -13,3 +13,24 @@ build/
 .next/
 
 docs/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Private/generated data
+secrets/
+private/
+*.pdf
+*.zip
+*.tar
+*.gz
+*.tgz
+
+# OS/editor noise
+.DS_Store
