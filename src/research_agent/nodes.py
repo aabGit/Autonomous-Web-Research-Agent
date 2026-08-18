@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -12,11 +13,24 @@ from research_agent.state import Finding, ResearchState
 from research_agent.tools import fetch_url, web_search
 
 
+# Prompt style: few-shot examples + function-style JSON (the model must
+# return this object the way a tool/function call would).
 PLAN_PROMPT = """You are a research planner.
-Break the user's question into 3-5 focused web search queries.
-Return JSON only: {"queries": ["...", "..."]}
+Break the user's question into 2-3 focused web search queries.
+
+Examples of good output:
+
+Question: What is LangGraph?
+{"queries": ["LangGraph official docs", "LangGraph vs LangChain agents", "LangGraph state and checkpointing"]}
+
+Question: How does RAG reduce hallucinations?
+{"queries": ["retrieval augmented generation overview", "RAG hallucination reduction", "vector database RAG best practices"]}
+
+Return JSON only in this shape:
+{"queries": ["...", "..."]}
 """
 
+# Prompt style: zero-shot — instructions only, no examples.
 SYNTH_PROMPT = """You are a careful research writer.
 Use ONLY the retrieved notes. Cite URLs inline like (https://...).
 If something is unknown, say so. Write markdown with:
@@ -25,10 +39,18 @@ If something is unknown, say so. Write markdown with:
 - Open questions
 """
 
+# Prompt style: chain-of-thought, then function-style JSON.
 CRITIQUE_PROMPT = """You are a skeptical editor.
-Given the original question and the draft report, list missing facts.
-Return JSON only: {"done": true/false, "gaps": ["..."]}
+Think step by step before you answer:
+1. What did the user actually ask?
+2. Which claims in the draft have sources?
+3. What important facts are still missing?
+
+Then return JSON only:
+{"done": true/false, "gaps": ["missing search query", "..."]}
+
 Set done=true if the report reasonably answers the question.
+Keep the reasoning above the JSON. Do not put the reasoning inside the JSON.
 """
 
 
@@ -55,43 +77,65 @@ def plan_node(state: ResearchState) -> dict:
     )
     payload = _json_from_model(str(response.content))
     queries = payload.get("queries") or [state["question"]]
-    return {"plan": queries[:5], "loop": state.get("loop", 0)}
+    return {"plan": queries[:3], "loop": state.get("loop", 0)}
 
 
 def search_node(state: ResearchState) -> dict:
+    settings = get_settings()
     queries = state.get("gaps") or state.get("plan") or [state["question"]]
     findings: list[Finding] = list(state.get("findings") or [])
     sources = list(state.get("sources") or [])
     seen = {item["url"] for item in findings}
+    pending: list[tuple[str, dict]] = []
 
-    for query in queries[:4]:
+    for query in queries[:3]:
         for hit in web_search(query):
             url = hit["url"]
             if not url or url in seen:
                 continue
             seen.add(url)
-            try:
-                content = fetch_url(url)
-            except Exception:
-                content = hit.get("snippet") or ""
-            finding: Finding = {
-                "query": query,
-                "title": hit.get("title") or url,
-                "url": url,
-                "snippet": hit.get("snippet") or "",
-                "content": content,
-            }
-            findings.append(finding)
-            sources.append(url)
+            pending.append((query, hit))
+            if len(pending) >= settings.max_pages_per_run:
+                break
+        if len(pending) >= settings.max_pages_per_run:
+            break
+
+    def _fetch_one(item: tuple[str, dict]) -> Finding:
+        query, hit = item
+        url = hit["url"]
+        try:
+            content = fetch_url(url)
+        except Exception:
+            content = hit.get("snippet") or ""
+        return {
+            "query": query,
+            "title": hit.get("title") or url,
+            "url": url,
+            "snippet": hit.get("snippet") or "",
+            "content": content,
+        }
+
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+            fetched = list(pool.map(_fetch_one, pending))
+        findings.extend(fetched)
+        sources.extend(item["url"] for item in fetched)
 
     return {"findings": findings, "sources": sources}
 
 
 def ingest_node(state: ResearchState) -> dict:
     run_id = state.get("question", "")[:80]
+    ingested = list(state.get("ingested_urls") or [])
+    seen = set(ingested)
     for finding in state.get("findings") or []:
+        url = finding["url"]
+        if url in seen:
+            continue
         ingest_finding(run_id, finding)
-    return {}
+        seen.add(url)
+        ingested.append(url)
+    return {"ingested_urls": ingested}
 
 
 def synthesize_node(state: ResearchState) -> dict:
@@ -149,6 +193,7 @@ def initial_state(question: str) -> ResearchState:
         "gaps": [],
         "loop": 0,
         "done": False,
+        "ingested_urls": [],
     }
 
 

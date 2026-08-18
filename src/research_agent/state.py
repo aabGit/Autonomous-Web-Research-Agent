@@ -26,3 +26,4 @@ class ResearchState(TypedDict):
     gaps: list[str]
     loop: int
     done: bool
+    ingested_urls: list[str]

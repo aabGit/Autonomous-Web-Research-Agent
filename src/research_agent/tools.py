@@ -56,7 +56,8 @@ def _tavily_search(query: str, limit: int, api_key: str) -> list[dict]:
 def fetch_url(url: str) -> str:
     settings = get_settings()
     headers = {"User-Agent": "Mozilla/5.0 (compatible; ResearchAgent/0.1)"}
-    with httpx.Client(follow_redirects=True, timeout=20.0, headers=headers) as client:
+    timeout = settings.fetch_timeout_seconds
+    with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as client:
         response = client.get(url)
         response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
